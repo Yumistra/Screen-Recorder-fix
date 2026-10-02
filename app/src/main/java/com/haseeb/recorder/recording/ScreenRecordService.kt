@@ -346,7 +346,7 @@ class ScreenRecordService : Service() {
 
         val hasMicPerm = checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         val wantMic = configManager.isMicEnabled && hasMicPerm
-        val wantSysAudio = configManager.isSystemAudioEnabled && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+        val wantSysAudio = configManager.isSystemAudioEnabled && hasMicPerm && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
         hasAnyAudio = wantMic || wantSysAudio
         stopRequested = false
 
@@ -375,7 +375,10 @@ class ScreenRecordService : Service() {
                 start()
             }
 
-            if (hasAnyAudio) setupAudioEncoders(wantMic, wantSysAudio)
+            if (hasAnyAudio) {
+                setupAudioEncoders(wantMic, wantSysAudio)
+                hasAnyAudio = micRecord != null || sysRecord != null
+            }
 
             mediaMuxer = if (outputFileDescriptor != null) {
                 MediaMuxer(outputFileDescriptor!!.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
@@ -499,16 +502,27 @@ class ScreenRecordService : Service() {
         }
 
         if (wantSysAudio && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val captureConfig = AudioPlaybackCaptureConfiguration.Builder(mediaProjection!!)
-                .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-                .addMatchingUsage(AudioAttributes.USAGE_GAME)
-                .build()
-            val minBuf = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-            sysRecord = AudioRecord.Builder()
-                .setAudioPlaybackCaptureConfig(captureConfig)
-                .setAudioFormat(AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(sampleRate).setChannelMask(AudioFormat.CHANNEL_IN_MONO).build())
-                .setBufferSizeInBytes(minBuf * 4)
-                .build()
+            try {
+                val captureConfig = AudioPlaybackCaptureConfiguration.Builder(mediaProjection!!)
+                    .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                    .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                    .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                    .build()
+                val minBuf = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+                val rec = AudioRecord.Builder()
+                    .setAudioPlaybackCaptureConfig(captureConfig)
+                    .setAudioFormat(AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(sampleRate).setChannelMask(AudioFormat.CHANNEL_IN_MONO).build())
+                    .setBufferSizeInBytes(minBuf * 4)
+                    .build()
+                if (rec.state == AudioRecord.STATE_INITIALIZED) {
+                    sysRecord = rec
+                } else {
+                    Log.e(TAG, "System audio AudioRecord not initialized (state=${rec.state})")
+                    rec.release()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "System audio capture init failed: ${e.message}")
+            }
         }
     }
 
@@ -523,6 +537,9 @@ class ScreenRecordService : Service() {
         val sysBuf = ShortArray(frameSamples)
         val mixBuf = ShortArray(frameSamples)
         val tmpBytes = ByteArray(frameSamples * 2)
+        var sysPeak = 0
+        var sysCount = 0
+        var sysReported = sysRecord == null
 
         while (!stopRequested) {
             if (isPaused) {
@@ -534,15 +551,26 @@ class ScreenRecordService : Service() {
             val sysSamples = sysRecord?.read(sysBuf, 0, frameSamples) ?: 0
             val validSamples = maxOf(micSamples, sysSamples, 0)
 
-            if (validSamples > 0) {
-                if (isMuted) {
-                    mixBuf.fill(0)
+            if (!sysReported) {
+                if (sysSamples < 0) {
+                    Log.e(TAG, "System audio read error: $sysSamples")
+                    sysReported = true
                 } else {
-                    for (i in 0 until validSamples) {
-                        val mVal = if (i < micSamples) micBuf[i].toInt() else 0
-                        val sVal = if (i < sysSamples) sysBuf[i].toInt() else 0
-                        mixBuf[i] = (mVal + sVal).coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
+                    for (i in 0 until sysSamples) sysPeak = maxOf(sysPeak, kotlin.math.abs(sysBuf[i].toInt()))
+                    sysCount += sysSamples
+                    if (sysCount >= 48000 * 5) {
+                        Log.i(TAG, "System audio peak in first 5s: $sysPeak (0 = OS delivered only silence)")
+                        sysReported = true
                     }
+                }
+            }
+
+            if (validSamples > 0) {
+                val micMuted = isMuted
+                for (i in 0 until validSamples) {
+                    val mVal = if (!micMuted && i < micSamples) micBuf[i].toInt() else 0
+                    val sVal = if (i < sysSamples) sysBuf[i].toInt() else 0
+                    mixBuf[i] = (mVal + sVal).coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
                 }
 
                 val bb = ByteBuffer.wrap(tmpBytes).order(ByteOrder.LITTLE_ENDIAN)
