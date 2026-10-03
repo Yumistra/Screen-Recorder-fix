@@ -27,6 +27,7 @@ import com.haseeb.recorder.camera.CameraOverlayService
 import com.haseeb.recorder.data.ConfigManager
 import com.haseeb.recorder.draw.DrawOverlayService
 import com.haseeb.recorder.overlay.RecordingOverlayService
+import com.haseeb.recorder.shizuku.ShizukuAudioClient
 import com.haseeb.recorder.shizuku.ShizukuManager
 import com.haseeb.recorder.ui.activity.MainActivity
 import java.io.File
@@ -106,6 +107,9 @@ class ScreenRecordService : Service() {
 
     private var micRecord: AudioRecord? = null
     @Volatile private var sysRecord: AudioRecord? = null
+    @Volatile private var shizukuAudio: ShizukuAudioClient? = null
+    @Volatile private var sysPeak = 0
+    @Volatile private var sysFrames = 0L
 
     @Volatile private var audioRecordingThread: Thread? = null
     @Volatile private var videoEncoderThread: Thread? = null
@@ -377,7 +381,7 @@ class ScreenRecordService : Service() {
 
             if (hasAnyAudio) {
                 setupAudioEncoders(wantMic, wantSysAudio)
-                hasAnyAudio = micRecord != null || sysRecord != null
+                hasAnyAudio = micRecord != null || sysRecord != null || shizukuAudio != null
             }
 
             mediaMuxer = if (outputFileDescriptor != null) {
@@ -501,7 +505,30 @@ class ScreenRecordService : Service() {
             micRecord = AudioRecord(MediaRecorder.AudioSource.MIC, sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, minBuf * 4)
         }
 
-        if (wantSysAudio) sysRecord = createPlaybackCaptureRecord(sampleRate)
+        sysPeak = 0
+        sysFrames = 0L
+        // With Shizuku the capture runs as the shell identity, which can also record apps in
+        // "call" audio mode. Playback on the device is untouched either way.
+        if (wantSysAudio && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            configManager.isShizukuEnhancedAudioEnabled && ShizukuManager.isPermissionGranted()
+        ) {
+            shizukuAudio = ShizukuAudioClient(this).takeIf { it.bind() }?.also { it.startAsync(sampleRate) }
+        }
+        if (wantSysAudio && shizukuAudio == null) sysRecord = createPlaybackCaptureRecord(sampleRate)
+    }
+
+    /*
+     * Shows a notice and puts the full text on the clipboard (toasts are cut after two lines).
+     */
+    private fun notifyWithClipboard(message: String, detail: String) {
+        Log.w(TAG, "$message: $detail")
+        mainHandler.post {
+            try {
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                clipboard.setPrimaryClip(android.content.ClipData.newPlainText("recorder-audio", "$message\n$detail"))
+                android.widget.Toast.makeText(applicationContext, message, android.widget.Toast.LENGTH_LONG).show()
+            } catch (_: Exception) {}
+        }
     }
 
     /*
@@ -548,14 +575,52 @@ class ScreenRecordService : Service() {
         val mixBuf = ShortArray(frameSamples)
         val tmpBytes = ByteArray(frameSamples * 2)
 
+        var shz = shizukuAudio
+        var shzReady = false
+        val shzBuf = ShortArray(frameSamples * 2)
+
         while (!stopRequested) {
+            if (shz != null && !shzReady) {
+                when (shz.state) {
+                    ShizukuAudioClient.STATE_READY -> {
+                        shzReady = true
+                        Log.i(TAG, "Shizuku audio capture ready: ${shz.message}")
+                    }
+                    ShizukuAudioClient.STATE_FAILED -> {
+                        notifyWithClipboard("Shizuku 오디오 캡처 실패, 일반 캡처로 녹음합니다 (오류가 클립보드에 복사됨)", shz.message ?: "unknown")
+                        shz.release()
+                        shz = null
+                        shizukuAudio = null
+                        sysRecord = createPlaybackCaptureRecord(48000)?.also { it.startRecording() }
+                    }
+                }
+            }
+
             if (isPaused) {
-                SystemClock.sleep(10)
+                // Keep draining so no stale audio is left in the capture buffer after resume.
+                if (shz != null && shzReady) shz.read(shzBuf, frameSamples) else SystemClock.sleep(10)
                 continue
             }
 
             val micSamples = micRecord?.read(micBuf, 0, frameSamples) ?: 0
-            var sysSamples = sysRecord?.read(sysBuf, 0, frameSamples) ?: 0
+            var sysSamples = when {
+                shz != null && shzReady -> {
+                    val frames = shz.read(shzBuf, frameSamples)
+                    for (i in 0 until frames) sysBuf[i] = ((shzBuf[2 * i] + shzBuf[2 * i + 1]) / 2).toShort()
+                    frames
+                }
+                shz != null -> 0
+                else -> sysRecord?.read(sysBuf, 0, frameSamples) ?: 0
+            }
+            if (sysSamples > 0) {
+                var peak = sysPeak
+                for (i in 0 until sysSamples) {
+                    val v = sysBuf[i].toInt()
+                    if (v > peak) peak = v else if (-v > peak) peak = -v
+                }
+                sysPeak = peak
+                sysFrames += sysSamples
+            }
 
             // No source delivered data: keep the audio track alive with silence instead of spinning.
             if (micSamples <= 0 && sysSamples <= 0) {
@@ -681,6 +746,19 @@ class ScreenRecordService : Service() {
         try { videoEncoderThread?.join(1000) } catch (_: Exception) {}
         try { if (muxerStarted) mediaMuxer?.stop() } catch (_: Exception) {}
 
+        val audioClient = shizukuAudio
+        shizukuAudio = null
+        if (audioClient != null) {
+            val wasSilent = sysPeak == 0 && sysFrames >= 48000L * 3
+            Thread({
+                val players = if (wasSilent) audioClient.describePlayers() else null
+                audioClient.release()
+                if (players != null) {
+                    notifyWithClipboard("시스템 소리가 전부 무음으로 녹음됐습니다 (원인 정보가 클립보드에 복사됨)", players)
+                }
+            }, "ShizukuAudioStop").start()
+        }
+
         cleanup()
         isRecording = false
         sendStateBroadcast(STATE_STOP)
@@ -692,6 +770,7 @@ class ScreenRecordService : Service() {
     private fun cleanup() {
         micRecord?.release(); micRecord = null
         sysRecord?.release(); sysRecord = null
+        shizukuAudio?.release(); shizukuAudio = null
         try { audioEncoder?.stop() } catch (_: Exception) {}; audioEncoder?.release(); audioEncoder = null
         try { videoEncoder?.stop() } catch (_: Exception) {}; videoEncoder?.release(); videoEncoder = null
         inputSurface?.release(); inputSurface = null
