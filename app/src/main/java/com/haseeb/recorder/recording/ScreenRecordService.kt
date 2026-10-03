@@ -27,7 +27,6 @@ import com.haseeb.recorder.camera.CameraOverlayService
 import com.haseeb.recorder.data.ConfigManager
 import com.haseeb.recorder.draw.DrawOverlayService
 import com.haseeb.recorder.overlay.RecordingOverlayService
-import com.haseeb.recorder.shizuku.ShizukuAudioClient
 import com.haseeb.recorder.shizuku.ShizukuManager
 import com.haseeb.recorder.ui.activity.MainActivity
 import java.io.File
@@ -107,8 +106,6 @@ class ScreenRecordService : Service() {
 
     private var micRecord: AudioRecord? = null
     @Volatile private var sysRecord: AudioRecord? = null
-    @Volatile private var shizukuAudio: ShizukuAudioClient? = null
-    @Volatile private var monitorTrack: AudioTrack? = null
 
     @Volatile private var audioRecordingThread: Thread? = null
     @Volatile private var videoEncoderThread: Thread? = null
@@ -352,8 +349,6 @@ class ScreenRecordService : Service() {
         val wantSysAudio = configManager.isSystemAudioEnabled && hasMicPerm && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
         hasAnyAudio = wantMic || wantSysAudio
         stopRequested = false
-        if (!configManager.isSystemAudioEnabled) showAudioDiag("[진단] 시스템 오디오: 설정에서 꺼져 있음")
-        else if (!wantSysAudio) showAudioDiag("[진단] 시스템 오디오: RECORD_AUDIO 권한 없음 또는 Android 10 미만")
 
         try {
             val videoMime = if (configManager.videoEncoder == ConfigManager.ENCODER_HEVC && isH265Supported()) {
@@ -381,10 +376,8 @@ class ScreenRecordService : Service() {
             }
 
             if (hasAnyAudio) {
-                val useShizukuAudio = wantSysAudio && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-                    configManager.isShizukuEnhancedAudioEnabled && ShizukuManager.isPermissionGranted()
-                setupAudioEncoders(wantMic, wantSysAudio, useShizukuAudio)
-                hasAnyAudio = micRecord != null || sysRecord != null || shizukuAudio != null
+                setupAudioEncoders(wantMic, wantSysAudio)
+                hasAnyAudio = micRecord != null || sysRecord != null
             }
 
             mediaMuxer = if (outputFileDescriptor != null) {
@@ -502,7 +495,7 @@ class ScreenRecordService : Service() {
     /*
      * Configures the audio encoders based on selected sources.
      */
-    private fun setupAudioEncoders(wantMic: Boolean, wantSysAudio: Boolean, useShizukuAudio: Boolean) {
+    private fun setupAudioEncoders(wantMic: Boolean, wantSysAudio: Boolean) {
         val sampleRate = 48000
         val audioFormat = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, 1).apply {
             setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
@@ -518,16 +511,12 @@ class ScreenRecordService : Service() {
             micRecord = AudioRecord(MediaRecorder.AudioSource.MIC, sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, minBuf * 4)
         }
 
-        if (wantSysAudio && useShizukuAudio) {
-            shizukuAudio = ShizukuAudioClient(this).takeIf { it.bind() }
-        }
-        if (wantSysAudio && shizukuAudio == null) {
-            sysRecord = createPlaybackCaptureRecord(sampleRate)
-        }
+        if (wantSysAudio) sysRecord = createPlaybackCaptureRecord(sampleRate)
     }
 
     /*
-     * Creates the standard MediaProjection playback capture (only apps that allow capture are heard).
+     * Creates the MediaProjection playback capture. Android hands over a copy of the audio,
+     * so playback on the device is left untouched (only apps that allow capture are recorded).
      */
     private fun createPlaybackCaptureRecord(sampleRate: Int): AudioRecord? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
@@ -558,71 +547,6 @@ class ScreenRecordService : Service() {
     }
 
     /*
-     * Picks the device the user would normally hear media on (headset first, then the speaker).
-     */
-    private fun pickMonitorDevice(): AudioDeviceInfo? {
-        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        val outputs = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-        val order = intArrayOf(
-            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
-            AudioDeviceInfo.TYPE_BLE_HEADSET,
-            AudioDeviceInfo.TYPE_HEARING_AID,
-            AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
-            AudioDeviceInfo.TYPE_WIRED_HEADSET,
-            AudioDeviceInfo.TYPE_USB_HEADSET,
-            AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
-        )
-        for (type in order) {
-            for (device in outputs) if (device.type == type) return device
-        }
-        return null
-    }
-
-    /*
-     * Shizuku capture takes the sound away from the device, so the captured audio is played
-     * back here. The track is pinned to a real output device; without that it would be routed
-     * into the capture again and echo.
-     */
-    private fun createMonitorTrack(sampleRate: Int): AudioTrack? {
-        return try {
-            val device = pickMonitorDevice() ?: return null
-            val minBuf = AudioTrack.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT)
-            val track = AudioTrack.Builder()
-                .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
-                .setAudioFormat(AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(sampleRate).setChannelMask(AudioFormat.CHANNEL_OUT_STEREO).build())
-                .setBufferSizeInBytes(maxOf(minBuf * 2, 16384))
-                .setTransferMode(AudioTrack.MODE_STREAM)
-                .build()
-            if (track.state != AudioTrack.STATE_INITIALIZED || !track.setPreferredDevice(device)) {
-                track.release()
-                return null
-            }
-            track.play()
-            track
-        } catch (e: Exception) {
-            Log.e(TAG, "Monitor track failed: ${e.message}")
-            null
-        }
-    }
-
-    /*
-     * Keeps the monitor on a real device when headphones are plugged or unplugged.
-     */
-    private fun updateMonitorRouting(track: AudioTrack) {
-        try {
-            val device = pickMonitorDevice()
-            if (device == null) {
-                if (track.playState == AudioTrack.PLAYSTATE_PLAYING) { track.pause(); track.flush() }
-                return
-            }
-            if (track.preferredDevice?.id != device.id) track.setPreferredDevice(device)
-            if (track.playState != AudioTrack.PLAYSTATE_PLAYING) track.play()
-        } catch (e: Exception) {
-            Log.e(TAG, "Monitor routing failed: ${e.message}")
-        }
-    }
-
-    /*
      * Continuously processes and multiplexes audio from system and microphone streams.
      */
     private fun drainAudioEncoder() {
@@ -636,60 +560,15 @@ class ScreenRecordService : Service() {
         var sysPeak = 0
         var sysCount = 0
         var sysReported = false
-        var shz = shizukuAudio
-        var shzReady = false
-        val shzDeadline = SystemClock.elapsedRealtime() + 5000
-        val shzBuf = ShortArray(frameSamples * 2)
-        var monitorTick = 0
 
         while (!stopRequested) {
             if (isPaused) {
-                // Keep the device audible while paused: Shizuku capture is still holding the output.
-                val frames = if (shz != null && shzReady) shz.read(shzBuf, frameSamples) else 0
-                if (frames > 0) monitorTrack?.write(shzBuf, 0, frames * 2, AudioTrack.WRITE_NON_BLOCKING)
-                else SystemClock.sleep(10)
+                SystemClock.sleep(10)
                 continue
             }
 
-            if (shz != null && !shzReady) {
-                val error = when {
-                    shz.isConnected -> shz.start(48000)
-                    SystemClock.elapsedRealtime() > shzDeadline -> "연결 시간 초과"
-                    else -> ""
-                }
-                if (error == null) {
-                    shzReady = true
-                    monitorTrack = createMonitorTrack(48000)
-                    showAudioDiag(if (monitorTrack != null) "[진단] Shizuku 전체 출력 캡처 시작 (기기로 다시 재생 중)" else "[진단] Shizuku 전체 출력 캡처 시작 (재생 장치 없음: 녹화 중 기기 소리 꺼짐)")
-                } else if (error.isNotEmpty()) {
-                    showAudioDiag("[진단] Shizuku 캡처 실패: $error → 일반 캡처로 전환")
-                    shz.release()
-                    shz = null
-                    shizukuAudio = null
-                    sysRecord = createPlaybackCaptureRecord(48000)?.also { it.startRecording() }
-                }
-            }
-
             val micSamples = micRecord?.read(micBuf, 0, frameSamples) ?: 0
-            val sysRead = when {
-                shz != null && shzReady -> {
-                    val frames = shz.read(shzBuf, frameSamples)
-                    if (frames > 0) {
-                        val monitor = monitorTrack
-                        if (monitor != null) {
-                            if (++monitorTick >= 25) {
-                                monitorTick = 0
-                                updateMonitorRouting(monitor)
-                            }
-                            monitor.write(shzBuf, 0, frames * 2, AudioTrack.WRITE_NON_BLOCKING)
-                        }
-                        for (i in 0 until frames) sysBuf[i] = ((shzBuf[2 * i] + shzBuf[2 * i + 1]) / 2).toShort()
-                    }
-                    frames
-                }
-                shz != null -> 0
-                else -> sysRecord?.read(sysBuf, 0, frameSamples) ?: 0
-            }
+            val sysRead = sysRecord?.read(sysBuf, 0, frameSamples) ?: 0
             var sysSamples = sysRead
 
             if (micSamples <= 0 && sysSamples <= 0) {
@@ -707,7 +586,8 @@ class ScreenRecordService : Service() {
                     for (i in 0 until sysRead) sysPeak = maxOf(sysPeak, kotlin.math.abs(sysBuf[i].toInt()))
                     sysCount += sysRead
                     if (sysCount >= 48000 * 5) {
-                        showAudioDiag(if (sysPeak == 0) "[진단] 시스템 오디오: 5초간 무음만 수신 (peak=0)" else "[진단] 시스템 오디오: 수신 중 (peak=$sysPeak)")
+                        if (sysPeak == 0) showAudioDiag("[진단] 시스템 오디오: 5초간 무음만 수신 (이 앱이 캡처를 막거나 재생 중인 소리가 없음)")
+                        else Log.i(TAG, "System audio OK (peak=$sysPeak)")
                         sysReported = true
                     }
                 }
@@ -840,8 +720,6 @@ class ScreenRecordService : Service() {
     private fun cleanup() {
         micRecord?.release(); micRecord = null
         sysRecord?.release(); sysRecord = null
-        shizukuAudio?.release(); shizukuAudio = null
-        monitorTrack?.let { try { it.release() } catch (_: Exception) {} }; monitorTrack = null
         try { audioEncoder?.stop() } catch (_: Exception) {}; audioEncoder?.release(); audioEncoder = null
         try { videoEncoder?.stop() } catch (_: Exception) {}; videoEncoder?.release(); videoEncoder = null
         inputSurface?.release(); inputSurface = null
