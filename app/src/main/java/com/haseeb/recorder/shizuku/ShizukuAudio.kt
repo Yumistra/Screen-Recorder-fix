@@ -29,16 +29,15 @@ private const val TRANSACTION_DESTROY = 16777115
 /*
  * Runs inside the Shizuku user-service process (shell uid), NOT inside the app.
  * Captures the whole device audio output through REMOTE_SUBMIX, which the shell
- * identity is allowed to open, and hands mono 16-bit PCM back over Binder.
+ * identity is allowed to open, and hands stereo 16-bit PCM back over Binder.
  * While this capture is active Android routes media playback to the submix,
- * so the device itself stays silent.
+ * so the device itself stays silent unless the app plays the audio back.
  */
 class ShizukuAudioService : Binder {
 
     private val baseContext: Context?
     private var record: AudioRecord? = null
     private var stereoBuf = ByteArray(0)
-    private var monoBuf = ByteArray(0)
 
     constructor() : super() {
         baseContext = null
@@ -62,10 +61,10 @@ class ShizukuAudioService : Binder {
             TRANSACTION_READ -> {
                 data.enforceInterface(DESCRIPTOR)
                 val frames = data.readInt().coerceIn(1, 8192)
-                val bytes = readMono(frames)
+                val bytes = readStereo(frames)
                 reply?.writeNoException()
                 reply?.writeInt(bytes)
-                if (bytes > 0) reply?.writeByteArray(monoBuf, 0, bytes)
+                if (bytes > 0) reply?.writeByteArray(stereoBuf, 0, bytes)
                 return true
             }
             TRANSACTION_STOP -> {
@@ -120,27 +119,13 @@ class ShizukuAudioService : Binder {
     }
 
     /*
-     * Blocking read of [frames] stereo frames, downmixed to mono. Returns the byte count or a negative error.
+     * Blocking read of [frames] stereo frames. Returns the byte count or a negative error.
      */
-    private fun readMono(frames: Int): Int {
+    private fun readStereo(frames: Int): Int {
         val rec = record ?: return -1
         if (stereoBuf.size < frames * 4) stereoBuf = ByteArray(frames * 4)
-        if (monoBuf.size < frames * 2) monoBuf = ByteArray(frames * 2)
         val read = rec.read(stereoBuf, 0, frames * 4)
-        if (read <= 0) return read
-        val got = read / 4
-        var s = 0
-        var m = 0
-        for (i in 0 until got) {
-            val l = (stereoBuf[s].toInt() and 0xFF) or (stereoBuf[s + 1].toInt() shl 8)
-            val r = (stereoBuf[s + 2].toInt() and 0xFF) or (stereoBuf[s + 3].toInt() shl 8)
-            val v = (l + r) / 2
-            monoBuf[m] = v.toByte()
-            monoBuf[m + 1] = (v shr 8).toByte()
-            s += 4
-            m += 2
-        }
-        return got * 2
+        return if (read > 0) read - (read % 4) else read
     }
 
     private fun stopCapture() {
@@ -193,7 +178,7 @@ class ShizukuAudioClient(context: Context) {
 
     private val args = Shizuku.UserServiceArgs(
         ComponentName(context.packageName, ShizukuAudioService::class.java.name)
-    ).daemon(false).processNameSuffix("audio").debuggable(false).version(1)
+    ).daemon(false).processNameSuffix("audio").debuggable(false).version(2)
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -244,16 +229,17 @@ class ShizukuAudioClient(context: Context) {
     }
 
     /*
-     * Blocking read of up to [samples] mono samples. Returns the sample count or a negative error.
+     * Blocking read of up to [frames] interleaved stereo frames into [out] (needs frames * 2 shorts).
+     * Returns the frame count or a negative error.
      */
-    fun read(out: ShortArray, samples: Int): Int {
+    fun read(out: ShortArray, frames: Int): Int {
         val binder = remote
         if (binder == null || !started) return -1
         val data = Parcel.obtain()
         val reply = Parcel.obtain()
         return try {
             data.writeInterfaceToken(DESCRIPTOR)
-            data.writeInt(samples)
+            data.writeInt(frames)
             binder.transact(TRANSACTION_READ, data, reply, 0)
             reply.readException()
             val bytes = reply.readInt()
@@ -261,8 +247,8 @@ class ShizukuAudioClient(context: Context) {
                 bytes
             } else {
                 val buf = reply.createByteArray() ?: return -1
-                val count = minOf(buf.size / 2, samples, out.size)
-                ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(out, 0, count)
+                val count = minOf(buf.size / 4, frames, out.size / 2)
+                ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(out, 0, count * 2)
                 count
             }
         } catch (e: Throwable) {
