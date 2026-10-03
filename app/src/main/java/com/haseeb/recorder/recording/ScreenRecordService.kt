@@ -108,6 +108,7 @@ class ScreenRecordService : Service() {
     private var micRecord: AudioRecord? = null
     @Volatile private var sysRecord: AudioRecord? = null
     @Volatile private var shizukuAudio: ShizukuAudioClient? = null
+    @Volatile private var monitorTrack: AudioTrack? = null
 
     @Volatile private var audioRecordingThread: Thread? = null
     @Volatile private var videoEncoderThread: Thread? = null
@@ -557,6 +558,71 @@ class ScreenRecordService : Service() {
     }
 
     /*
+     * Picks the device the user would normally hear media on (headset first, then the speaker).
+     */
+    private fun pickMonitorDevice(): AudioDeviceInfo? {
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val outputs = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+        val order = intArrayOf(
+            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
+            AudioDeviceInfo.TYPE_BLE_HEADSET,
+            AudioDeviceInfo.TYPE_HEARING_AID,
+            AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+            AudioDeviceInfo.TYPE_WIRED_HEADSET,
+            AudioDeviceInfo.TYPE_USB_HEADSET,
+            AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+        )
+        for (type in order) {
+            for (device in outputs) if (device.type == type) return device
+        }
+        return null
+    }
+
+    /*
+     * Shizuku capture takes the sound away from the device, so the captured audio is played
+     * back here. The track is pinned to a real output device; without that it would be routed
+     * into the capture again and echo.
+     */
+    private fun createMonitorTrack(sampleRate: Int): AudioTrack? {
+        return try {
+            val device = pickMonitorDevice() ?: return null
+            val minBuf = AudioTrack.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT)
+            val track = AudioTrack.Builder()
+                .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
+                .setAudioFormat(AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(sampleRate).setChannelMask(AudioFormat.CHANNEL_OUT_STEREO).build())
+                .setBufferSizeInBytes(maxOf(minBuf * 2, 16384))
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+            if (track.state != AudioTrack.STATE_INITIALIZED || !track.setPreferredDevice(device)) {
+                track.release()
+                return null
+            }
+            track.play()
+            track
+        } catch (e: Exception) {
+            Log.e(TAG, "Monitor track failed: ${e.message}")
+            null
+        }
+    }
+
+    /*
+     * Keeps the monitor on a real device when headphones are plugged or unplugged.
+     */
+    private fun updateMonitorRouting(track: AudioTrack) {
+        try {
+            val device = pickMonitorDevice()
+            if (device == null) {
+                if (track.playState == AudioTrack.PLAYSTATE_PLAYING) { track.pause(); track.flush() }
+                return
+            }
+            if (track.preferredDevice?.id != device.id) track.setPreferredDevice(device)
+            if (track.playState != AudioTrack.PLAYSTATE_PLAYING) track.play()
+        } catch (e: Exception) {
+            Log.e(TAG, "Monitor routing failed: ${e.message}")
+        }
+    }
+
+    /*
      * Continuously processes and multiplexes audio from system and microphone streams.
      */
     private fun drainAudioEncoder() {
@@ -573,10 +639,15 @@ class ScreenRecordService : Service() {
         var shz = shizukuAudio
         var shzReady = false
         val shzDeadline = SystemClock.elapsedRealtime() + 5000
+        val shzBuf = ShortArray(frameSamples * 2)
+        var monitorTick = 0
 
         while (!stopRequested) {
             if (isPaused) {
-                SystemClock.sleep(10)
+                // Keep the device audible while paused: Shizuku capture is still holding the output.
+                val frames = if (shz != null && shzReady) shz.read(shzBuf, frameSamples) else 0
+                if (frames > 0) monitorTrack?.write(shzBuf, 0, frames * 2, AudioTrack.WRITE_NON_BLOCKING)
+                else SystemClock.sleep(10)
                 continue
             }
 
@@ -588,7 +659,8 @@ class ScreenRecordService : Service() {
                 }
                 if (error == null) {
                     shzReady = true
-                    showAudioDiag("[진단] Shizuku 전체 출력 캡처 시작 (녹화 중 기기 소리는 꺼짐)")
+                    monitorTrack = createMonitorTrack(48000)
+                    showAudioDiag(if (monitorTrack != null) "[진단] Shizuku 전체 출력 캡처 시작 (기기로 다시 재생 중)" else "[진단] Shizuku 전체 출력 캡처 시작 (재생 장치 없음: 녹화 중 기기 소리 꺼짐)")
                 } else if (error.isNotEmpty()) {
                     showAudioDiag("[진단] Shizuku 캡처 실패: $error → 일반 캡처로 전환")
                     shz.release()
@@ -600,7 +672,21 @@ class ScreenRecordService : Service() {
 
             val micSamples = micRecord?.read(micBuf, 0, frameSamples) ?: 0
             val sysRead = when {
-                shz != null && shzReady -> shz.read(sysBuf, frameSamples)
+                shz != null && shzReady -> {
+                    val frames = shz.read(shzBuf, frameSamples)
+                    if (frames > 0) {
+                        val monitor = monitorTrack
+                        if (monitor != null) {
+                            if (++monitorTick >= 25) {
+                                monitorTick = 0
+                                updateMonitorRouting(monitor)
+                            }
+                            monitor.write(shzBuf, 0, frames * 2, AudioTrack.WRITE_NON_BLOCKING)
+                        }
+                        for (i in 0 until frames) sysBuf[i] = ((shzBuf[2 * i] + shzBuf[2 * i + 1]) / 2).toShort()
+                    }
+                    frames
+                }
                 shz != null -> 0
                 else -> sysRecord?.read(sysBuf, 0, frameSamples) ?: 0
             }
@@ -755,6 +841,7 @@ class ScreenRecordService : Service() {
         micRecord?.release(); micRecord = null
         sysRecord?.release(); sysRecord = null
         shizukuAudio?.release(); shizukuAudio = null
+        monitorTrack?.let { try { it.release() } catch (_: Exception) {} }; monitorTrack = null
         try { audioEncoder?.stop() } catch (_: Exception) {}; audioEncoder?.release(); audioEncoder = null
         try { videoEncoder?.stop() } catch (_: Exception) {}; videoEncoder?.release(); videoEncoder = null
         inputSurface?.release(); inputSurface = null
